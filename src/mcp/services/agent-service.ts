@@ -191,9 +191,14 @@ export class AgentService {
      * Create the Mastra agent with tools
      */
     private createAgent(tools: Record<string, unknown>): Agent {
+        // openai.chat() forces the Chat Completions endpoint instead of the
+        // newer Responses API (which is the default of openai()). Many
+        // providers routed via OpenAI-compatible proxies (LiteLLM → GitHub
+        // Copilot, etc.) don't implement /v1/responses, but every provider
+        // implements /v1/chat/completions.
         const model = this.model.startsWith('gemini')
             ? google(this.model)
-            : openai(this.model);
+            : openai.chat(this.model);
 
         return new Agent({
             id: 'sonos-agent-tool',
