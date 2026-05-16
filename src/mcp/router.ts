@@ -46,7 +46,8 @@ import {
     handleBrowseTracks,
     handleBrowseGenres,
     handleBrowsePlaylists,
-    handleGetFavoriteRadioStations,
+    handleGetFavorites,
+    handlePlayFavorite,
     handleSearchLibrary,
     handleBrowseItem,
 } from './handlers/library-handlers.js';
@@ -132,7 +133,8 @@ const baseHandlers: ToolHandlerMap = {
     'sonos_browse_tracks': handleBrowseTracks,
     'sonos_browse_genres': handleBrowseGenres,
     'sonos_browse_playlists': handleBrowsePlaylists,
-    'sonos_get_favorite_radio_stations': handleGetFavoriteRadioStations,
+    'sonos_get_favorites': handleGetFavorites,
+    'sonos_play_favorite': handlePlayFavorite,
     'sonos_search_library': handleSearchLibrary,
     'sonos_browse_item': handleBrowseItem,
 

@@ -235,130 +235,22 @@ describe('ContentDirectoryService', () => {
         });
     });
 
-    describe('getFavoriteRadioStations', () => {
-        // Build a Browse response body wrapping DIDL-Lite XML.
-        // The real flow: Sonos returns DIDL-Lite XML-escaped inside <Result>;
-        // ContentDirectoryService unescapes it before calling fromDidlString.
-        function buildBrowseBody(didl: string, total: number): string {
-            const escaped = didl
-                .replace(/&/g, '&amp;')
-                .replace(/</g, '&lt;')
-                .replace(/>/g, '&gt;')
-                .replace(/"/g, '&quot;');
-            return `<Result>${escaped}</Result><TotalMatches>${total}</TotalMatches><NumberReturned>${total}</NumberReturned>`;
-        }
+    describe('getFavorites', () => {
+        it('should browse FV:2', async () => {
+            const mockResponse = {
+                success: true,
+                body: `<Result>&lt;DIDL-Lite&gt;&lt;/DIDL-Lite&gt;</Result><TotalMatches>0</TotalMatches><NumberReturned>0</NumberReturned>`,
+            };
 
-        function didlItem(id: string, parentId: string, title: string, uri: string | null, upnpClass: string): string {
-            const resTag = uri ? `<res>${uri.replace(/&/g, '&amp;')}</res>` : '';
-            return `<item id="${id}" parentID="${parentId}" restricted="true"><dc:title>${title}</dc:title>${resTag}<upnp:class>${upnpClass}</upnp:class></item>`;
-        }
-
-        const DIDL_OPEN = '<DIDL-Lite xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/">';
-        const DIDL_CLOSE = '</DIDL-Lite>';
-
-        it('should query both R:0/0 and FV:2', async () => {
             const callActionSpy = vi.spyOn(service as unknown as TestableContentDirectoryService, 'callAction')
-                .mockResolvedValue({
-                    success: true,
-                    body: buildBrowseBody(`${DIDL_OPEN}${DIDL_CLOSE}`, 0),
-                });
+                .mockResolvedValue(mockResponse);
 
-            await service.getFavoriteRadioStations();
+            await service.getFavorites();
 
-            const calls = callActionSpy.mock.calls;
-            const bodies = calls.map(c => c[1]);
-            expect(bodies.some(b => b.includes('R:0/0'))).toBe(true);
-            expect(bodies.some(b => b.includes('FV:2'))).toBe(true);
-        });
-
-        it('should filter FV:2 to radio-flavored URIs only', async () => {
-            const favoritesDidl = `${DIDL_OPEN}${[
-                didlItem('FV:2/65', 'FV:2', 'Cool Jazz', 'x-sonosapi-radio:user_channel?sid=188', 'object.itemobject.item.sonos-favorite'),
-                didlItem('FV:2/74', 'FV:2', 'Library', null, 'object.itemobject.item.sonos-favorite'),
-                didlItem('FV:2/75', 'FV:2', 'Some Playlist', 'file:///jffs/settings/savedqueues.rsq#5', 'object.itemobject.item.sonos-favorite'),
-            ].join('')}${DIDL_CLOSE}`;
-
-            vi.spyOn(service as unknown as TestableContentDirectoryService, 'callAction')
-                .mockImplementation(async (_action: string, body: string) => {
-                    if (body.includes('R:0/0')) {
-                        return { success: true, body: buildBrowseBody(`${DIDL_OPEN}${DIDL_CLOSE}`, 0) };
-                    }
-                    if (body.includes('FV:2')) {
-                        return { success: true, body: buildBrowseBody(favoritesDidl, 3) };
-                    }
-                    return { success: true, body: '' };
-                });
-
-            const result = await service.getFavoriteRadioStations();
-
-            expect(result.items.length).toBe(1);
-            expect(result.items[0].title).toBe('Cool Jazz');
-        });
-
-        it('should merge legacy R:0/0 and radio-flavored FV:2 items', async () => {
-            const legacyDidl = `${DIDL_OPEN}${didlItem('R:0/0/1', 'R:0/0', 'Legacy Radio', 'x-sonosapi-stream:s12345?sid=254', 'object.item.audioItem.audioBroadcast')}${DIDL_CLOSE}`;
-            const favoritesDidl = `${DIDL_OPEN}${didlItem('FV:2/65', 'FV:2', 'Cool Jazz', 'x-sonosapi-radio:user_channel?sid=188', 'object.itemobject.item.sonos-favorite')}${DIDL_CLOSE}`;
-
-            vi.spyOn(service as unknown as TestableContentDirectoryService, 'callAction')
-                .mockImplementation(async (_action: string, body: string) => {
-                    if (body.includes('R:0/0')) {
-                        return { success: true, body: buildBrowseBody(legacyDidl, 1) };
-                    }
-                    if (body.includes('FV:2')) {
-                        return { success: true, body: buildBrowseBody(favoritesDidl, 1) };
-                    }
-                    return { success: true, body: '' };
-                });
-
-            const result = await service.getFavoriteRadioStations();
-
-            expect(result.items.length).toBe(2);
-            expect(result.total).toBe(2);
-            const titles = result.items.map(i => i.title);
-            expect(titles).toContain('Legacy Radio');
-            expect(titles).toContain('Cool Jazz');
-        });
-
-        it('should dedupe by URI; legacy R:0/0 wins on collision', async () => {
-            const sharedUri = 'x-sonosapi-stream:s12345?sid=254';
-            const legacyDidl = `${DIDL_OPEN}${didlItem('R:0/0/1', 'R:0/0', 'Legacy Title', sharedUri, 'object.item.audioItem.audioBroadcast')}${DIDL_CLOSE}`;
-            const favoritesDidl = `${DIDL_OPEN}${didlItem('FV:2/99', 'FV:2', 'Favorite Title', sharedUri, 'object.itemobject.item.sonos-favorite')}${DIDL_CLOSE}`;
-
-            vi.spyOn(service as unknown as TestableContentDirectoryService, 'callAction')
-                .mockImplementation(async (_action: string, body: string) => {
-                    if (body.includes('R:0/0')) {
-                        return { success: true, body: buildBrowseBody(legacyDidl, 1) };
-                    }
-                    if (body.includes('FV:2')) {
-                        return { success: true, body: buildBrowseBody(favoritesDidl, 1) };
-                    }
-                    return { success: true, body: '' };
-                });
-
-            const result = await service.getFavoriteRadioStations();
-
-            expect(result.items.length).toBe(1);
-            expect(result.items[0].title).toBe('Legacy Title');
-        });
-
-        it('should work when R:0/0 is empty (typical S2 case)', async () => {
-            const favoritesDidl = `${DIDL_OPEN}${didlItem('FV:2/65', 'FV:2', 'Cool Jazz', 'x-sonosapi-radio:user_channel?sid=188', 'object.itemobject.item.sonos-favorite')}${DIDL_CLOSE}`;
-
-            vi.spyOn(service as unknown as TestableContentDirectoryService, 'callAction')
-                .mockImplementation(async (_action: string, body: string) => {
-                    if (body.includes('R:0/0')) {
-                        return { success: true, body: buildBrowseBody(`${DIDL_OPEN}${DIDL_CLOSE}`, 0) };
-                    }
-                    if (body.includes('FV:2')) {
-                        return { success: true, body: buildBrowseBody(favoritesDidl, 1) };
-                    }
-                    return { success: true, body: '' };
-                });
-
-            const result = await service.getFavoriteRadioStations();
-
-            expect(result.items.length).toBe(1);
-            expect(result.items[0].title).toBe('Cool Jazz');
+            expect(callActionSpy).toHaveBeenCalledWith(
+                'Browse',
+                expect.stringContaining('FV:2')
+            );
         });
     });
 

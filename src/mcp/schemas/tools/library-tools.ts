@@ -122,8 +122,8 @@ export const libraryTools: Tool[] = [
         },
     },
     {
-        name: 'sonos_get_favorite_radio_stations',
-        description: 'Get favorite radio stations from Sonos favorites. Returns a list of saved radio stations with their metadata and streaming URIs.',
+        name: 'sonos_get_favorites',
+        description: 'Get the Sonos Favorites (FV:2) — the unified favorites list visible in the Sonos app, including radio stations, playlists, albums, tracks, and library shortcuts. Each item is annotated with `playableAs` (stream | container | track | unknown) derived from the URI scheme. To play a favorite, prefer sonos_play_favorite over extracting the URI yourself — it handles the container-vs-stream distinction correctly.',
         inputSchema: {
             type: 'object',
             properties: {
@@ -140,6 +140,28 @@ export const libraryTools: Tool[] = [
                     type: 'number',
                     description: 'Number of items to return (default: 100)',
                     default: 100,
+                },
+            },
+            required: ['deviceId'],
+        },
+    },
+    {
+        name: 'sonos_play_favorite',
+        description: 'Play a Sonos Favorite (from FV:2) by title or id. Exactly one of `title` (case-insensitive exact match) or `id` (e.g. FV:2/65 from sonos_get_favorites) is required. Handles both stream favorites (radio, single tracks — played directly) and container favorites (albums, playlists — enqueued and played from track 1, since Sonos rejects SetAVTransportURI for container schemes with UPnP 714).',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                deviceId: {
+                    type: 'string',
+                    description: 'Room name, UUID, or IP address',
+                },
+                title: {
+                    type: 'string',
+                    description: 'Exact favorite title (case-insensitive). Either title or id is required.',
+                },
+                id: {
+                    type: 'string',
+                    description: 'Favorite ID (e.g. "FV:2/65") from a sonos_get_favorites result. Either title or id is required.',
                 },
             },
             required: ['deviceId'],
