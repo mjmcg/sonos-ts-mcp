@@ -250,12 +250,85 @@ export class ContentDirectoryService extends BaseService {
     }
 
     /**
-     * Get favorite radio stations
-     * @param options - Browse options
-     * @returns Search result with radio stations
+     * URI schemes that identify a "radio-flavored" favorite — i.e. a stream
+     * the user would expect to play directly, not a container/playlist/track.
+     *
+     * - x-sonosapi-stream:    TuneIn / Sonos Radio direct streams
+     * - x-sonosapi-radio:     Sonos Radio (algorithmic stations like "Cool Jazz")
+     * - x-sonosapi-hls:       HLS streams
+     * - x-rincon-mp3radio:    plain MP3 stream URLs added as radio
+     * - pndrradio:            Pandora stations
+     * - hls-radio://, aac://: a few partner services
+     */
+    private static readonly RADIO_URI_PREFIXES = [
+        'x-sonosapi-stream:',
+        'x-sonosapi-radio:',
+        'x-sonosapi-hls:',
+        'x-rincon-mp3radio:',
+        'pndrradio:',
+        'hls-radio:',
+        'aac:',
+    ];
+
+    private isRadioUri(uri: string | undefined): boolean {
+        if (!uri) return false;
+        const lower = uri.toLowerCase();
+        return ContentDirectoryService.RADIO_URI_PREFIXES.some(p => lower.startsWith(p));
+    }
+
+    /**
+     * Get favorite radio stations.
+     *
+     * On S2 systems, radio stations added via the Sonos app land in the
+     * generic favorites container `FV:2`, not the legacy "My Radio Stations"
+     * container `R:0/0` (which was for the old pre-S2 "My Radio" feature
+     * and is typically empty on modern Sonos). We query both, filter `FV:2`
+     * down to items whose resource URI looks like a radio stream, dedupe
+     * by URI, and return a merged list. Pagination is applied in-memory
+     * against the merged set — radio-favorites lists are tiny (<<100 items)
+     * so this is fine.
      */
     async getFavoriteRadioStations(options: BrowseOptions = {}): Promise<SearchResult> {
-        return this.browse(this.getSearchTypeObjectId('radio_stations'), options);
+        const { startIndex = 0, count = 100 } = options;
+
+        // Fetch both sources with generous counts; favorites are small.
+        const fetchCount = 1000;
+        const [legacy, favorites] = await Promise.all([
+            this.browse(this.getSearchTypeObjectId('radio_stations'), {
+                startIndex: 0,
+                count: fetchCount,
+            }),
+            this.browse(this.getSearchTypeObjectId('sonos_favorites'), {
+                startIndex: 0,
+                count: fetchCount,
+            }),
+        ]);
+
+        // Keep only radio-flavored items from FV:2 (it also contains
+        // playlists, tracks, and library shortcuts).
+        const radioFavorites = favorites.items.filter(item =>
+            this.isRadioUri(item.resources[0]?.uri)
+        );
+
+        // Dedupe by URI, preferring legacy R:0/0 entries first so their
+        // (typically simpler) ids/titles win on collisions.
+        const seen = new Set<string>();
+        const merged: DidlObject[] = [];
+        for (const item of [...legacy.items, ...radioFavorites]) {
+            const uri = item.resources[0]?.uri ?? `__no-uri__:${item.id}`;
+            if (seen.has(uri)) continue;
+            seen.add(uri);
+            merged.push(item);
+        }
+
+        const total = merged.length;
+        const sliced = merged.slice(startIndex, startIndex + count);
+
+        return {
+            items: sliced,
+            total,
+            returned: sliced.length,
+        };
     }
 
     /**
