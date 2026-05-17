@@ -213,10 +213,16 @@ export class SMAPIClient {
         householdId: string,
         linkCode: string,
         linkDeviceId: string,
-        options: { maxAttempts?: number; baseDelayMs?: number } = {},
+        options: { maxAttempts?: number; baseDelayMs?: number; maxDelayMs?: number } = {},
     ): Promise<{ authToken: string; privateKey: string } | null> {
-        const maxAttempts = options.maxAttempts ?? 6;
-        const baseDelayMs = options.baseDelayMs ?? 800;
+        // Defaults give roughly a 30-second window: AccuRadio's
+        // Server.NOT_LINKED_RETRY tends to either clear in the first
+        // few seconds (just-approved propagation) or persist indefinitely
+        // (link code expired or never registered). 30s captures the
+        // former without burning too much time on the latter.
+        const maxAttempts = options.maxAttempts ?? 8;
+        const baseDelayMs = options.baseDelayMs ?? 1000;
+        const maxDelayMs = options.maxDelayMs ?? 8000;
 
         for (let attempt = 0; attempt < maxAttempts; attempt++) {
             const body = await this.smapiCall(
@@ -244,7 +250,7 @@ export class SMAPIClient {
             if (!isTransientAuthFault(this.lastFault)) {
                 return null;
             }
-            const delay = baseDelayMs * Math.pow(1.5, attempt);
+            const delay = Math.min(maxDelayMs, baseDelayMs * Math.pow(1.5, attempt));
             await new Promise(resolve => setTimeout(resolve, delay));
         }
 

@@ -202,14 +202,40 @@ export class SmapiAuthFlow {
                 `getDeviceAuthToken returned no token pair for ${this.service.name} ` +
                 `(deviceId=${deviceId}, linkDeviceId=${effectiveLinkDeviceId}).`;
             if (fault) {
+                // Persistent NOT_LINKED_RETRY (after our 30s retry window)
+                // is not a propagation race — it means the service's
+                // backend genuinely doesn't have this link code. Most
+                // common reasons:
+                //   1. Code expired (TTL ~60s on some services). Re-run
+                //      sonos_smapi_auth_begin to get a fresh code.
+                //   2. Partner site regenerated the code on login.
+                //      Some services display a different code than they
+                //      internally associate with the approval. If the
+                //      partner site shows you a code that looks
+                //      different from what auth_begin returned, use the
+                //      site's code.
+                //   3. Approval never completed on the partner site
+                //      (closed the tab, login failed, etc).
+                const isTransient = /retry/i.test(fault.faultCode) || /retry/i.test(fault.faultString);
+                if (isTransient) {
+                    throw new Error(
+                        `${baseMessage} SMAPI fault after ~30s of retries: ${fault.faultCode}: ` +
+                        `${fault.faultString || '(no detail)'}. The service's backend ` +
+                        `still doesn't recognise this link code. Most likely causes: ` +
+                        `(a) link code expired — re-run sonos_smapi_auth_begin for a ` +
+                        `fresh code and complete the partner-site flow within ~60s; ` +
+                        `(b) the partner site issued a different code internally after ` +
+                        `login — if the URL or page after approval shows a code that ` +
+                        `differs from what sonos_smapi_auth_begin returned, pass the ` +
+                        `site's code as linkCode; (c) the approval never completed on ` +
+                        `the partner site. Set SMAPI_DEBUG=1 in the container env and ` +
+                        `rerun to see the exact envelopes.`
+                    );
+                }
                 throw new Error(
                     `${baseMessage} SMAPI fault: ${fault.faultCode}: ${fault.faultString || '(no detail)'}. ` +
                     `Common causes: link code expired (re-run sonos_smapi_auth_begin), ` +
-                    `partner approval not yet propagated after ~13s of retries (try ` +
-                    `clicking approve again on the partner site), wrong linkDeviceId, ` +
-                    `or you ran sonos_smapi_auth_begin against a different deviceId ` +
-                    `than this complete call (the link is bound to the deviceId in the ` +
-                    `credentials header — use the SAME deviceId for begin and complete).`
+                    `wrong linkDeviceId, or service refused the household.`
                 );
             }
             // 200 OK with no fault AND no token. This is the diagnostic
