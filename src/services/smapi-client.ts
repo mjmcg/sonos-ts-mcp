@@ -7,6 +7,7 @@ import type {
 import {
     buildSmapiEnvelope,
     buildSmapiSoapAction,
+    SMAPI_USER_AGENT,
     type SmapiLoginToken,
 } from './smapi/envelope.js';
 
@@ -24,16 +25,17 @@ import {
  * is invoked with the new pair and the call is retried once.
  */
 export interface SmapiClientOptions {
-    /** Required for any authenticated call. */
+    /** R_TrialZPSerial from SystemProperties or the player's UDN. */
     deviceId: string;
-    /** Optional; defaults to 'Sonos'. */
-    deviceProvider?: string;
-    /** Required only for the auth flow itself. */
-    householdId?: string;
+    /**
+     * Household ID from DeviceProperties.GetHouseholdID — required by
+     * the documented envelope shape, which always carries it inside
+     * <s:loginToken><s:householdId>. Used by both the pre-auth flow and
+     * authenticated calls.
+     */
+    householdId: string;
     /** Stored token pair for authenticated services. */
     loginToken?: SmapiLoginToken;
-    /** Legacy session id (UserID-style services). */
-    sessionId?: string;
     /**
      * Invoked when the service replies with a Client.TokenRefreshRequired
      * fault that embeds a fresh token pair. Used by callers to persist
@@ -41,6 +43,8 @@ export interface SmapiClientOptions {
      * the return — the retry happens immediately after.
      */
     onTokenRefresh?: (pair: SmapiLoginToken) => void;
+    /** Optional timezone override; defaults to "+00:00". */
+    timezone?: string;
     /** Override fetch (used by tests). */
     fetchImpl?: typeof fetch;
 }
@@ -264,10 +268,6 @@ export class SMAPIClient {
             return null;
         }
 
-        const isAuthenticatedService =
-            this.serviceDescriptor.authType === 'DeviceLink' ||
-            this.serviceDescriptor.authType === 'AppLink';
-
         const envelope = buildSmapiEnvelope({
             method,
             args: Object.fromEntries(
@@ -275,10 +275,18 @@ export class SMAPIClient {
             ),
             credentials: {
                 deviceId: this.options.deviceId,
-                deviceProvider: this.options.deviceProvider,
-                includeContext: isAuthenticatedService,
-                loginToken: opts.allowUnauthed ? undefined : this.options.loginToken,
-                sessionId: this.options.sessionId,
+                householdId: this.options.householdId,
+                // During the pre-auth flow we deliberately emit an empty
+                // loginToken (the envelope builder handles this when
+                // loginToken is undefined). Otherwise extract token+key
+                // from the stored pair — householdId is set above.
+                loginToken: opts.allowUnauthed || !this.options.loginToken
+                    ? undefined
+                    : {
+                        token: this.options.loginToken.token,
+                        key: this.options.loginToken.key,
+                    },
+                timezone: this.options.timezone,
             },
         });
 
@@ -306,7 +314,7 @@ export class SMAPIClient {
 
         if (fault.faultCode.includes('TokenRefreshRequired')) {
             const refreshed = this.extractRefreshedToken(response.body);
-            if (refreshed && this.options.householdId && this.options.onTokenRefresh) {
+            if (refreshed && this.options.onTokenRefresh) {
                 this.options.onTokenRefresh({
                     token: refreshed.authToken,
                     key: refreshed.privateKey,
@@ -320,14 +328,12 @@ export class SMAPIClient {
                     ),
                     credentials: {
                         deviceId: this.options.deviceId,
-                        deviceProvider: this.options.deviceProvider,
-                        includeContext: isAuthenticatedService,
+                        householdId: this.options.householdId,
                         loginToken: {
                             token: refreshed.authToken,
                             key: refreshed.privateKey,
-                            householdId: this.options.householdId,
                         },
-                        sessionId: this.options.sessionId,
+                        timezone: this.options.timezone,
                     },
                 });
                 const retry = await this.postEnvelope(endpoint, method, retryEnvelope);
@@ -368,8 +374,16 @@ export class SMAPIClient {
             const resp = await f(endpoint, {
                 method: 'POST',
                 headers: {
-                    'Content-Type': 'text/xml; charset="utf-8"',
+                    // Headers exactly as documented at
+                    // sonos.svrooij.io/music-services.html. Apple Music
+                    // (and likely other strict services) gate on a
+                    // Sonos-shaped User-Agent — without it we get the
+                    // empty-result / music:// dead-end paths.
+                    'Content-Type': 'text/xml; charset=utf8',
                     'SOAPACTION': buildSmapiSoapAction(method),
+                    'Accept-Language': 'en-US',
+                    'Accept-Encoding': 'gzip, deflate',
+                    'User-Agent': SMAPI_USER_AGENT,
                 },
                 body: envelope,
             });

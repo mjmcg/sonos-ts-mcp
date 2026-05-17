@@ -33,7 +33,7 @@ function emptyMetadataResponse(): string {
 }
 
 describe('SMAPIClient.getMetadata', () => {
-    it('posts a SOAP Header containing credentials with deviceId + deviceProvider', async () => {
+    it('posts the svrooij-shape SOAP envelope with Sonos-style headers', async () => {
         const fetchImpl = vi.fn(async () => {
             return new Response(emptyMetadataResponse(), {
                 status: 200,
@@ -43,6 +43,7 @@ describe('SMAPIClient.getMetadata', () => {
 
         const client = new SMAPIClient(descriptor('Anonymous'), {
             deviceId: 'RINCON_AAA',
+            householdId: 'Sonos_HH',
             fetchImpl,
         });
 
@@ -51,32 +52,26 @@ describe('SMAPIClient.getMetadata', () => {
         expect(fetchImpl).toHaveBeenCalledOnce();
         const [, init] = (fetchImpl as unknown as ReturnType<typeof vi.fn>).mock.calls[0];
         const body = init.body as string;
-
-        // Header structure (the bug we're fixing).
-        expect(body).toMatch(/<s:Header>[\s\S]*<credentials[\s\S]*<\/credentials>[\s\S]*<\/s:Header>/);
-        expect(body).toContain('<deviceId>RINCON_AAA</deviceId>');
-        expect(body).toContain('<deviceProvider>Sonos</deviceProvider>');
-        // SOAPACTION wrapping in quotes per spec.
         const headers = init.headers as Record<string, string>;
+
+        // Documented envelope structure.
+        expect(body).toMatch(/<soap:Header>[\s\S]*<s:credentials>[\s\S]*<\/s:credentials>[\s\S]*<\/soap:Header>/);
+        expect(body).toContain('<s:deviceId>RINCON_AAA</s:deviceId>');
+        expect(body).toContain('<s:householdId>Sonos_HH</s:householdId>');
+        // No deviceProvider — sonoscli quirk, not in svrooij docs.
+        expect(body).not.toContain('deviceProvider');
+
+        // HTTP headers per svrooij — particularly the Sonos User-Agent
+        // (Apple Music gates on it) and explicit Accept-Language /
+        // Accept-Encoding.
         expect(headers.SOAPACTION).toBe('"http://www.sonos.com/Services/1.1#getMetadata"');
+        expect(headers['User-Agent']).toContain('Sonos/');
+        expect(headers['User-Agent']).toContain('iPhone7,1');
+        expect(headers['Accept-Language']).toBe('en-US');
+        expect(headers['Accept-Encoding']).toBe('gzip, deflate');
     });
 
-    it('adds <context></context> to credentials for DeviceLink/AppLink services', async () => {
-        const fetchImpl = vi.fn(async () =>
-            new Response(emptyMetadataResponse(), { status: 200 })
-        ) as unknown as typeof fetch;
-
-        const client = new SMAPIClient(descriptor('AppLink'), {
-            deviceId: 'RINCON_AAA',
-            fetchImpl,
-        });
-        await client.getMetadata('root', 0, 100);
-
-        const body = (fetchImpl as unknown as ReturnType<typeof vi.fn>).mock.calls[0][1].body as string;
-        expect(body).toContain('<context></context>');
-    });
-
-    it('emits loginToken block when configured', async () => {
+    it('always includes <s:context><s:timezone> as a sibling of <s:credentials>', async () => {
         const fetchImpl = vi.fn(async () =>
             new Response(emptyMetadataResponse(), { status: 200 })
         ) as unknown as typeof fetch;
@@ -84,16 +79,50 @@ describe('SMAPIClient.getMetadata', () => {
         const client = new SMAPIClient(descriptor('AppLink'), {
             deviceId: 'RINCON_AAA',
             householdId: 'Sonos_HH',
-            loginToken: { token: 'TOK', key: 'KEY', householdId: 'Sonos_HH' },
             fetchImpl,
         });
         await client.getMetadata('root', 0, 100);
 
         const body = (fetchImpl as unknown as ReturnType<typeof vi.fn>).mock.calls[0][1].body as string;
-        expect(body).toContain('<loginToken>');
-        expect(body).toContain('<token>TOK</token>');
-        expect(body).toContain('<key>KEY</key>');
-        expect(body).toContain('<householdId>Sonos_HH</householdId>');
+        expect(body).toContain('<s:context><s:timezone>+00:00</s:timezone></s:context>');
+        // Sibling-of-credentials structure, not nested inside.
+        const contextEnd = body.indexOf('</s:context>');
+        const credsStart = body.indexOf('<s:credentials>');
+        expect(contextEnd).toBeGreaterThan(-1);
+        expect(credsStart).toBeGreaterThan(-1);
+        expect(contextEnd).toBeLessThan(credsStart);
+    });
+
+    it('always emits <s:loginToken> — empty token/key for unauthenticated, populated when configured', async () => {
+        const fetchImpl = vi.fn(async () =>
+            new Response(emptyMetadataResponse(), { status: 200 })
+        ) as unknown as typeof fetch;
+
+        // Anonymous: empty token/key but householdId still inside loginToken.
+        const anonClient = new SMAPIClient(descriptor('Anonymous'), {
+            deviceId: 'RINCON_AAA',
+            householdId: 'Sonos_HH',
+            fetchImpl,
+        });
+        await anonClient.getMetadata('root', 0, 100);
+        const anonBody = (fetchImpl as unknown as ReturnType<typeof vi.fn>).mock.calls[0][1].body as string;
+        expect(anonBody).toContain('<s:loginToken>');
+        expect(anonBody).toContain('<s:token></s:token>');
+        expect(anonBody).toContain('<s:key></s:key>');
+        expect(anonBody).toContain('<s:householdId>Sonos_HH</s:householdId>');
+
+        // Authed: token + key populated.
+        const authedClient = new SMAPIClient(descriptor('AppLink'), {
+            deviceId: 'RINCON_AAA',
+            householdId: 'Sonos_HH',
+            loginToken: { token: 'TOK', key: 'KEY', householdId: 'Sonos_HH' },
+            fetchImpl,
+        });
+        await authedClient.getMetadata('root', 0, 100);
+        const authedBody = (fetchImpl as unknown as ReturnType<typeof vi.fn>).mock.calls[1][1].body as string;
+        expect(authedBody).toContain('<s:token>TOK</s:token>');
+        expect(authedBody).toContain('<s:key>KEY</s:key>');
+        expect(authedBody).toContain('<s:householdId>Sonos_HH</s:householdId>');
     });
 
     it('parses mediaCollection and mediaMetadata children', async () => {
@@ -126,6 +155,7 @@ describe('SMAPIClient.getMetadata', () => {
 
         const client = new SMAPIClient(descriptor('Anonymous'), {
             deviceId: 'RINCON_AAA',
+            householdId: 'Sonos_HH',
             fetchImpl,
         });
         const result = await client.getMetadata('root', 0, 100);
@@ -152,6 +182,7 @@ describe('SMAPIClient.getMetadata', () => {
 
         const client = new SMAPIClient(descriptor('AppLink'), {
             deviceId: 'RINCON_AAA',
+            householdId: 'Sonos_HH',
             fetchImpl,
         });
         const result = await client.getMetadata('root', 0, 100);
@@ -179,6 +210,7 @@ describe('SMAPIClient.getMetadata', () => {
 
         const client = new SMAPIClient(descriptor('DeviceLink'), {
             deviceId: 'RINCON_AAA',
+            householdId: 'Sonos_HH',
             fetchImpl,
         });
         const result = await client.getMetadata('root', 0, 100);
@@ -207,6 +239,7 @@ describe('SMAPIClient.getMetadata', () => {
 
         const client = new SMAPIClient(descriptor('AppLink'), {
             deviceId: 'RINCON_AAA',
+            householdId: 'Sonos_HH',
             fetchImpl,
         });
         await client.getMetadata('root', 0, 100);
@@ -248,6 +281,7 @@ describe('SMAPIClient.getMetadata', () => {
 
         const client = new SMAPIClient(descriptor('DeviceLink'), {
             deviceId: 'RINCON_AAA',
+            householdId: 'Sonos_HH',
             fetchImpl,
         });
         // Fast backoff for tests.
@@ -277,6 +311,7 @@ describe('SMAPIClient.getMetadata', () => {
 
         const client = new SMAPIClient(descriptor('DeviceLink'), {
             deviceId: 'RINCON_AAA',
+            householdId: 'Sonos_HH',
             fetchImpl,
         });
         const pair = await client.getDeviceAuthToken('Sonos_HH', 'CODE', 'RINCON_AAA', {
@@ -306,6 +341,7 @@ describe('SMAPIClient.getMetadata', () => {
 
         const client = new SMAPIClient(descriptor('DeviceLink'), {
             deviceId: 'RINCON_AAA',
+            householdId: 'Sonos_HH',
             fetchImpl,
         });
         const pair = await client.getDeviceAuthToken('Sonos_HH', 'CODE', 'RINCON_AAA', {
@@ -364,8 +400,8 @@ describe('SMAPIClient.getMetadata', () => {
         });
         // Second call should have used the refreshed token.
         const retryBody = (fetchImpl as unknown as ReturnType<typeof vi.fn>).mock.calls[1][1].body as string;
-        expect(retryBody).toContain('<token>NEW_TOK</token>');
-        expect(retryBody).toContain('<key>NEW_KEY</key>');
+        expect(retryBody).toContain('<s:token>NEW_TOK</s:token>');
+        expect(retryBody).toContain('<s:key>NEW_KEY</s:key>');
         expect(result.items).toEqual([]);
         errorSpy.mockRestore();
     });
@@ -390,6 +426,7 @@ describe('SMAPIClient.getMetadata', () => {
 
         const client = new SMAPIClient(descriptor('DeviceLink'), {
             deviceId: 'RINCON_AAA',
+            householdId: 'Sonos_HH',
             fetchImpl,
         });
         const result = await client.getDeviceAuthToken('Sonos_HH', 'CODE', 'RINCON_AAA', {
