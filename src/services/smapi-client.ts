@@ -45,14 +45,45 @@ export interface SmapiClientOptions {
     fetchImpl?: typeof fetch;
 }
 
-interface ParsedSoapFault {
+export interface ParsedSoapFault {
     faultCode: string;
     faultString: string;
+}
+
+/**
+ * SOAP fault codes we treat as transient "wait, the link approval hasn't
+ * propagated yet — try again" signals during getDeviceAuthToken. The user
+ * just clicked approve on the partner site; Sonos's backend has a brief
+ * window before the link becomes exchangeable.
+ *
+ * Casing is inconsistent across services — match case-insensitively on
+ * the substring after the last dot.
+ */
+const TRANSIENT_AUTH_FAULTS = [
+    'not_linked_retry',
+    'notlinkedretry',
+    'auth_retry',
+    'authretry',
+    'retry',
+];
+
+function isTransientAuthFault(fault: ParsedSoapFault | null): boolean {
+    if (!fault) return false;
+    const lower = fault.faultCode.toLowerCase();
+    return TRANSIENT_AUTH_FAULTS.some(t => lower.includes(t));
 }
 
 export class SMAPIClient {
     private readonly serviceDescriptor: MusicServiceDescriptor;
     private readonly options: SmapiClientOptions;
+
+    /**
+     * Most recent SOAP fault from any call on this client instance.
+     * Cleared at the start of every call. Lets auth-flow code surface
+     * meaningful errors to users without changing every method's return
+     * type to a Result<T, Fault>.
+     */
+    public lastFault: ParsedSoapFault | null = null;
 
     constructor(serviceDescriptor: MusicServiceDescriptor, options: SmapiClientOptions) {
         this.serviceDescriptor = serviceDescriptor;
@@ -157,22 +188,54 @@ export class SMAPIClient {
      * Exchange a completed link code for a token pair. Caller must
      * persist the returned pair (it is not stored here — keeps the
      * client free of filesystem dependencies).
+     *
+     * Retries with exponential backoff on transient "not linked yet"
+     * faults — there's a race between the user clicking "approve" on
+     * the partner site and Sonos's backend marking the household as
+     * linked. AccuRadio commonly takes 1–3 seconds.
+     *
+     * On terminal failure, `lastFault` is set so the caller can surface
+     * the actual SMAPI fault code/message to the user.
      */
     async getDeviceAuthToken(
         householdId: string,
         linkCode: string,
-        linkDeviceId: string
+        linkDeviceId: string,
+        options: { maxAttempts?: number; baseDelayMs?: number } = {},
     ): Promise<{ authToken: string; privateKey: string } | null> {
-        const body = await this.smapiCall(
-            'getDeviceAuthToken',
-            { householdId, linkCode, linkDeviceId },
-            { allowUnauthed: true }
-        );
-        if (!body) return null;
-        const authToken = this.extractValue(body, 'authToken');
-        const privateKey = this.extractValue(body, 'privateKey');
-        if (!authToken || !privateKey) return null;
-        return { authToken, privateKey };
+        const maxAttempts = options.maxAttempts ?? 6;
+        const baseDelayMs = options.baseDelayMs ?? 800;
+
+        for (let attempt = 0; attempt < maxAttempts; attempt++) {
+            const body = await this.smapiCall(
+                'getDeviceAuthToken',
+                { householdId, linkCode, linkDeviceId },
+                { allowUnauthed: true }
+            );
+
+            if (body) {
+                const authToken = this.extractValue(body, 'authToken');
+                const privateKey = this.extractValue(body, 'privateKey');
+                if (authToken && privateKey) {
+                    this.lastFault = null;
+                    return { authToken, privateKey };
+                }
+                // 200 OK but no token in body — treat as terminal; we
+                // have no signal to retry on.
+                return null;
+            }
+
+            // smapiCall returned null. If the fault is transient, back off
+            // and try again; otherwise bail with lastFault set.
+            if (!isTransientAuthFault(this.lastFault)) {
+                return null;
+            }
+            const delay = baseDelayMs * Math.pow(1.5, attempt);
+            await new Promise(resolve => setTimeout(resolve, delay));
+        }
+
+        // Out of attempts — lastFault holds the most recent transient fault.
+        return null;
     }
 
     // ─── low-level: build envelope, POST, parse SOAP fault ────────────────
@@ -182,6 +245,8 @@ export class SMAPIClient {
         args: Record<string, string | number | boolean>,
         opts: { allowUnauthed?: boolean } = {}
     ): Promise<string | null> {
+        this.lastFault = null;
+
         const endpoint = this.serviceDescriptor.secureUri || this.serviceDescriptor.uri;
         if (!endpoint) {
             console.error('SMAPI: service has no secureUri/uri');
@@ -209,14 +274,23 @@ export class SMAPIClient {
         const response = await this.postEnvelope(endpoint, method, envelope);
         if (!response) return null;
 
-        if (response.ok) {
+        // Check for SOAP fault FIRST — some services return 200 OK with a
+        // Fault embedded. Previously this path silently returned an
+        // unparseable body and the caller saw "empty result".
+        const fault = this.parseSoapFault(response.body);
+        if (fault) {
+            this.lastFault = fault;
+        } else if (response.ok) {
             return response.body;
         }
 
-        // SMAPI returns SOAP faults with HTTP 500. Inspect for token-
-        // refresh and retry once with the new credentials if available.
-        const fault = this.parseSoapFault(response.body);
-        if (fault?.faultCode.includes('TokenRefreshRequired')) {
+        if (!fault) {
+            // Non-OK status with no parseable fault. Log raw status and bail.
+            console.error(`SMAPI ${method} HTTP ${response.status}`);
+            return null;
+        }
+
+        if (fault.faultCode.includes('TokenRefreshRequired')) {
             const refreshed = this.extractRefreshedToken(response.body);
             if (refreshed && this.options.householdId && this.options.onTokenRefresh) {
                 this.options.onTokenRefresh({
@@ -243,9 +317,13 @@ export class SMAPIClient {
                     },
                 });
                 const retry = await this.postEnvelope(endpoint, method, retryEnvelope);
-                if (retry?.ok) return retry.body;
+                if (retry?.ok) {
+                    this.lastFault = null;
+                    return retry.body;
+                }
                 if (retry) {
                     const retryFault = this.parseSoapFault(retry.body);
+                    if (retryFault) this.lastFault = retryFault;
                     console.error(
                         `SMAPI ${method} after refresh: ${retryFault?.faultCode ?? 'HTTP error'}: ${retryFault?.faultString ?? ''}`
                     );
@@ -254,11 +332,9 @@ export class SMAPIClient {
             }
         }
 
-        if (fault) {
-            console.error(`SMAPI ${method} fault: ${fault.faultCode}: ${fault.faultString}`);
-        } else {
-            console.error(`SMAPI ${method} HTTP ${response.status}`);
-        }
+        // Terminal fault — log for container debugging; caller can read
+        // `lastFault` for the structured details.
+        console.error(`SMAPI ${method} fault: ${fault.faultCode}: ${fault.faultString}`);
         return null;
     }
 

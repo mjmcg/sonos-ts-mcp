@@ -161,6 +161,165 @@ describe('SMAPIClient.getMetadata', () => {
         errorSpy.mockRestore();
     });
 
+    it('detects SOAP faults on HTTP 200 responses (does not silently return empty)', async () => {
+        // Some services return 200 OK with a Fault embedded — previously
+        // our code silently called parseMetadataResponse on the fault
+        // body and returned an empty result, masking the real error.
+        const fault200 = `<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <s:Fault>
+      <faultcode>Client.NOT_LINKED_RETRY</faultcode>
+      <faultstring>Account not yet linked, retry</faultstring>
+    </s:Fault>
+  </s:Body>
+</s:Envelope>`;
+        const fetchImpl = vi.fn(async () => new Response(fault200, { status: 200 })) as unknown as typeof fetch;
+        const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+        const client = new SMAPIClient(descriptor('DeviceLink'), {
+            deviceId: 'RINCON_AAA',
+            fetchImpl,
+        });
+        const result = await client.getMetadata('root', 0, 100);
+
+        expect(result.items).toEqual([]);
+        // Crucial: lastFault is set, so callers can surface a real error.
+        expect(client.lastFault?.faultCode).toBe('Client.NOT_LINKED_RETRY');
+        expect(client.lastFault?.faultString).toBe('Account not yet linked, retry');
+        errorSpy.mockRestore();
+    });
+
+    it('clears lastFault on a successful call', async () => {
+        let call = 0;
+        const fetchImpl = vi.fn(async () => {
+            call++;
+            if (call === 1) {
+                return new Response(`<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+                    <s:Body><s:Fault>
+                      <faultcode>Client.Failure</faultcode>
+                      <faultstring>bad</faultstring>
+                    </s:Fault></s:Body></s:Envelope>`, { status: 500 });
+            }
+            return new Response(emptyMetadataResponse(), { status: 200 });
+        }) as unknown as typeof fetch;
+        const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+        const client = new SMAPIClient(descriptor('AppLink'), {
+            deviceId: 'RINCON_AAA',
+            fetchImpl,
+        });
+        await client.getMetadata('root', 0, 100);
+        expect(client.lastFault).not.toBeNull();
+
+        await client.getMetadata('root', 0, 100);
+        expect(client.lastFault).toBeNull();
+        errorSpy.mockRestore();
+    });
+
+    it('retries getDeviceAuthToken with backoff on NOT_LINKED_RETRY', async () => {
+        const transientFault = `<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body><s:Fault>
+    <faultcode>Client.NOT_LINKED_RETRY</faultcode>
+    <faultstring>retry</faultstring>
+  </s:Fault></s:Body>
+</s:Envelope>`;
+        const successResponse = `<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <getDeviceAuthTokenResponse xmlns="http://www.sonos.com/Services/1.1">
+      <getDeviceAuthTokenResult>
+        <authToken>FINAL_TOKEN</authToken>
+        <privateKey>FINAL_KEY</privateKey>
+      </getDeviceAuthTokenResult>
+    </getDeviceAuthTokenResponse>
+  </s:Body>
+</s:Envelope>`;
+
+        let call = 0;
+        const fetchImpl = vi.fn(async () => {
+            call++;
+            return call < 3
+                ? new Response(transientFault, { status: 500 })
+                : new Response(successResponse, { status: 200 });
+        }) as unknown as typeof fetch;
+        const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+        const client = new SMAPIClient(descriptor('DeviceLink'), {
+            deviceId: 'RINCON_AAA',
+            fetchImpl,
+        });
+        // Fast backoff for tests.
+        const pair = await client.getDeviceAuthToken('Sonos_HH', 'CODE', 'RINCON_AAA', {
+            maxAttempts: 5,
+            baseDelayMs: 1,
+        });
+
+        expect(pair).toEqual({ authToken: 'FINAL_TOKEN', privateKey: 'FINAL_KEY' });
+        expect(call).toBe(3);
+        expect(client.lastFault).toBeNull();
+        errorSpy.mockRestore();
+    });
+
+    it('getDeviceAuthToken does not retry on non-transient faults', async () => {
+        const terminalFault = `<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body><s:Fault>
+    <faultcode>Client.LoginUnauthorized</faultcode>
+    <faultstring>link code expired</faultstring>
+  </s:Fault></s:Body>
+</s:Envelope>`;
+        const fetchImpl = vi.fn(async () =>
+            new Response(terminalFault, { status: 500 })
+        ) as unknown as typeof fetch;
+        const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+        const client = new SMAPIClient(descriptor('DeviceLink'), {
+            deviceId: 'RINCON_AAA',
+            fetchImpl,
+        });
+        const pair = await client.getDeviceAuthToken('Sonos_HH', 'CODE', 'RINCON_AAA', {
+            maxAttempts: 5,
+            baseDelayMs: 1,
+        });
+
+        expect(pair).toBeNull();
+        // Just one call — no retry on a terminal fault.
+        expect((fetchImpl as unknown as ReturnType<typeof vi.fn>).mock.calls.length).toBe(1);
+        expect(client.lastFault?.faultCode).toBe('Client.LoginUnauthorized');
+        errorSpy.mockRestore();
+    });
+
+    it('getDeviceAuthToken gives up after maxAttempts on persistent transient fault', async () => {
+        const transientFault = `<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body><s:Fault>
+    <faultcode>Client.NOT_LINKED_RETRY</faultcode>
+    <faultstring>still waiting</faultstring>
+  </s:Fault></s:Body>
+</s:Envelope>`;
+        const fetchImpl = vi.fn(async () =>
+            new Response(transientFault, { status: 500 })
+        ) as unknown as typeof fetch;
+        const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+        const client = new SMAPIClient(descriptor('DeviceLink'), {
+            deviceId: 'RINCON_AAA',
+            fetchImpl,
+        });
+        const pair = await client.getDeviceAuthToken('Sonos_HH', 'CODE', 'RINCON_AAA', {
+            maxAttempts: 3,
+            baseDelayMs: 1,
+        });
+
+        expect(pair).toBeNull();
+        expect((fetchImpl as unknown as ReturnType<typeof vi.fn>).mock.calls.length).toBe(3);
+        // Caller can read lastFault to surface a useful message.
+        expect(client.lastFault?.faultCode).toBe('Client.NOT_LINKED_RETRY');
+        errorSpy.mockRestore();
+    });
+
     it('retries with refreshed token on Client.TokenRefreshRequired', async () => {
         const refreshFault = `<?xml version="1.0"?>
 <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">

@@ -91,8 +91,12 @@ export class SmapiAuthFlow {
         if (this.service.authType === 'DeviceLink') {
             const result = await client.getDeviceLinkCode(householdId);
             if (!result) {
+                throw this.faultError(client, `getDeviceLinkCode failed for ${this.service.name}`);
+            }
+            if (!result.regUrl || !result.linkCode) {
                 throw new Error(
-                    `getDeviceLinkCode failed for ${this.service.name}`
+                    `getDeviceLinkCode for ${this.service.name} returned an incomplete response ` +
+                    `(regUrl=${JSON.stringify(result.regUrl)}, linkCode=${JSON.stringify(result.linkCode)}).`
                 );
             }
             return {
@@ -105,51 +109,65 @@ export class SmapiAuthFlow {
         }
 
         if (this.service.authType === 'AppLink') {
-            // Try the bare-host AppLink call first (matches sonoscli's
-            // primary path). If the service ignores us — empty result —
-            // fall back to the iPhone-shaped payload which is what
-            // Sonos's own iOS app sends and most services accept.
-            let result = await client.getAppLink({
-                callbackPath: '',
-                hardware: 'sonos-ts-mcp',
-                householdId,
-                osVersion: '1.0',
-                sonosAppName: 'sonos-ts-mcp',
-            });
-            if (!result || (!result.appUrl && !result.regUrl)) {
-                result = await client.getAppLink({
+            // Many services (notably Apple Music) only return a usable
+            // <deviceLink> code if you claim to be an iPhone. The bare-
+            // host shape just gets you an `music://` deep link, which is
+            // unusable from a container. Try both and prefer any result
+            // that gave us a deviceLink the user can actually type.
+            const attempts: Array<Record<string, string>> = [
+                {
                     callbackPath: '',
                     hardware: 'iPhone15,2',
                     householdId,
                     osVersion: 'Version 17.5',
                     sonosAppName: 'ICRU_iPhone15,2',
-                });
-            }
-            if (!result || (!result.appUrl && !result.regUrl)) {
-                throw new Error(
-                    `getAppLink returned no device-link or app URL for ${this.service.name}`
-                );
+                },
+                {
+                    callbackPath: '',
+                    hardware: 'sonos-ts-mcp',
+                    householdId,
+                    osVersion: '1.0',
+                    sonosAppName: 'sonos-ts-mcp',
+                },
+            ];
+
+            type AppLinkResult = NonNullable<Awaited<ReturnType<typeof client.getAppLink>>>;
+            const results: AppLinkResult[] = [];
+            for (const args of attempts) {
+                const result = await client.getAppLink(args);
+                if (result) results.push(result);
+                // First result with a usable deviceLink wins — no point
+                // probing further.
+                if (result?.regUrl && result?.linkCode) break;
             }
 
-            if (result.regUrl && result.linkCode) {
+            const withDeviceLink = results.find(r => r.regUrl && r.linkCode);
+            if (withDeviceLink) {
                 return {
                     kind: 'devicelink',
-                    regUrl: result.regUrl,
-                    linkCode: result.linkCode,
-                    linkDeviceId: result.linkDeviceId,
-                    instructions: this.devicelinkInstructions(result.regUrl, result.linkCode),
+                    regUrl: withDeviceLink.regUrl,
+                    linkCode: withDeviceLink.linkCode,
+                    linkDeviceId: withDeviceLink.linkDeviceId,
+                    instructions: this.devicelinkInstructions(
+                        withDeviceLink.regUrl,
+                        withDeviceLink.linkCode,
+                    ),
                 };
             }
 
-            return {
-                kind: 'applink',
-                appUrl: result.appUrl,
-                instructions:
-                    `Open this URL and complete the authentication flow. The partner ` +
-                    `site will provide a code (sometimes redirected to a Sonos-style URL). ` +
-                    `Paste that code back here as 'linkCode' to call sonos_smapi_auth_complete.\n\n` +
-                    `URL: ${result.appUrl}`,
-            };
+            const withAppUrl = results.find(r => r.appUrl);
+            if (withAppUrl) {
+                return {
+                    kind: 'applink',
+                    appUrl: withAppUrl.appUrl,
+                    instructions: this.applinkInstructions(withAppUrl.appUrl, this.service.name),
+                };
+            }
+
+            throw this.faultError(
+                client,
+                `getAppLink returned no device-link or app URL for ${this.service.name}`
+            );
         }
 
         throw new Error(
@@ -179,10 +197,21 @@ export class SmapiAuthFlow {
             effectiveLinkDeviceId,
         );
         if (!pair) {
+            const fault = client.lastFault;
+            const baseMessage =
+                `getDeviceAuthToken returned no token pair for ${this.service.name}.`;
+            if (fault) {
+                throw new Error(
+                    `${baseMessage} SMAPI fault: ${fault.faultCode}: ${fault.faultString || '(no detail)'}. ` +
+                    `Common causes: link code expired (re-run sonos_smapi_auth_begin), ` +
+                    `partner flow not yet propagated (retry in a few seconds), or the ` +
+                    `wrong linkDeviceId.`
+                );
+            }
             throw new Error(
-                `getDeviceAuthToken returned no token pair for ${this.service.name}. ` +
-                `Common causes: link code expired, partner flow not completed yet, ` +
-                `or service refused the household.`
+                `${baseMessage} No SMAPI fault returned — common causes: link code ` +
+                `expired or service silently rejected. Re-run sonos_smapi_auth_begin ` +
+                `to get a fresh code.`
             );
         }
 
@@ -213,7 +242,46 @@ export class SmapiAuthFlow {
             `After you approve the link on the partner site, call ` +
             `sonos_smapi_auth_complete with the same linkCode to exchange it ` +
             `for a long-lived token and save it. The link code expires in ` +
-            `5–10 minutes depending on the service.`
+            `5–10 minutes depending on the service. The complete call retries ` +
+            `automatically on transient 'not linked yet' faults — if the ` +
+            `partner site shows success but the exchange still fails after ` +
+            `~10 seconds, the link code is probably already expired.`
+        );
+    }
+
+    private applinkInstructions(appUrl: string, serviceName: string): string {
+        return (
+            `${serviceName} returned only an app deep-link URL, not a typed ` +
+            `code. This flow is hard to complete from a containerised MCP ` +
+            `server because the partner-side redirect targets the Sonos app ` +
+            `(sonos://x-callback-url/...), which the MCP can't intercept.\n\n` +
+            `URL: ${appUrl}\n\n` +
+            `Options:\n` +
+            `  1. Link the service via a different tool that can register ` +
+            `as a sonos:// URL handler (e.g. sonoscli on a laptop), then ` +
+            `copy the token blob to MCP_DATA_DIR/smapi-tokens.json.\n` +
+            `  2. Open the URL in a browser, open DevTools, and capture the ` +
+            `partner redirect — the link code is in the URL fragment. Paste ` +
+            `that code to sonos_smapi_auth_complete.\n` +
+            `  3. Use sonos_get_favorites + sonos_play_favorite if you mainly ` +
+            `want to play stations / playlists you've already favorited in ` +
+            `the Sonos app — that path works without per-service linking.`
+        );
+    }
+
+    /**
+     * Wrap an SMAPIClient call failure in an Error that surfaces the SOAP
+     * fault details (if any) instead of forcing the caller to inspect
+     * client.lastFault separately.
+     */
+    private faultError(
+        client: SMAPIClient,
+        baseMessage: string,
+    ): Error {
+        const fault = client.lastFault;
+        if (!fault) return new Error(baseMessage);
+        return new Error(
+            `${baseMessage}. SMAPI fault: ${fault.faultCode}: ${fault.faultString || '(no detail)'}`
         );
     }
 }
