@@ -1,9 +1,10 @@
 import type { ServerContext, ToolResponse } from '../types/handler-types.js';
 import { MusicServiceRegistry } from '../../discovery/music-service-registry.js';
 import { SMAPIClient } from '../../services/smapi-client.js';
-import { MusicServicesService } from '../../services/music-services.js';
 import { AVTransportService } from '../../services/av-transport.js';
-import type { MusicServiceItem, MusicServiceContainer } from '../../types/music-services.js';
+import { resolveSmapiContext } from '../../services/smapi/auth-context.js';
+import type { MusicServiceItem, MusicServiceContainer, MusicServiceDescriptor } from '../../types/music-services.js';
+import type { SonosDevice } from '../../types/sonos.js';
 
 // Global registries per device (cached)
 const registries = new Map<string, MusicServiceRegistry>();
@@ -20,6 +21,23 @@ function getRegistry(context: ServerContext, deviceId: string): MusicServiceRegi
     }
 
     return registries.get(key)!;
+}
+
+/**
+ * Build an SMAPI client wired up with the player's deviceId + householdId.
+ * Commit 2 of the SMAPI rewrite will extend this to pull a stored
+ * `loginToken` from the on-disk token store for authenticated services.
+ */
+async function buildSmapiClient(
+    device: SonosDevice,
+    serviceDescriptor: MusicServiceDescriptor,
+): Promise<SMAPIClient> {
+    const { householdId, deviceId } = await resolveSmapiContext(device);
+    return new SMAPIClient(serviceDescriptor, {
+        deviceId,
+        householdId,
+        // loginToken is wired up in commit 2 once the token store lands.
+    });
 }
 
 /**
@@ -106,7 +124,8 @@ export async function handleBrowseMusicService(args: unknown, context: ServerCon
             };
         }
 
-        const client = new SMAPIClient(serviceDescriptor);
+        const device = context.resolver.resolve(deviceId);
+        const client = await buildSmapiClient(device, serviceDescriptor);
         const response = await client.getMetadata(containerId, startIndex, count);
 
         const items = response.items.map((item) => {
@@ -210,7 +229,8 @@ export async function handleSearchMusicService(args: unknown, context: ServerCon
             };
         }
 
-        const client = new SMAPIClient(serviceDescriptor);
+        const device = context.resolver.resolve(deviceId);
+        const client = await buildSmapiClient(device, serviceDescriptor);
         const response = await client.search(query, startIndex, count);
 
         const items = response.items.map((item) => ({
@@ -290,7 +310,7 @@ export async function handlePlayMusicServiceItem(args: unknown, context: ServerC
             };
         }
 
-        const client = new SMAPIClient(serviceDescriptor);
+        const client = await buildSmapiClient(device, serviceDescriptor);
         const uri = await client.getMediaURI(itemId);
 
         if (!uri) {
@@ -382,7 +402,8 @@ export async function handleGetMusicServiceItemUri(args: unknown, context: Serve
             };
         }
 
-        const client = new SMAPIClient(serviceDescriptor);
+        const device = context.resolver.resolve(deviceId);
+        const client = await buildSmapiClient(device, serviceDescriptor);
         const uri = await client.getMediaURI(itemId);
 
         if (!uri) {

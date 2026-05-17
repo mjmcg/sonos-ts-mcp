@@ -34,10 +34,22 @@ export default [
     languageOptions: {
       parser: tsparser,
       globals: {
+        // vitest
         describe: 'readonly',
         it: 'readonly',
         expect: 'readonly',
         beforeEach: 'readonly',
+        afterEach: 'readonly',
+        vi: 'readonly',
+        // Node 20 + Web Platform globals
+        console: 'readonly',
+        process: 'readonly',
+        Buffer: 'readonly',
+        setTimeout: 'readonly',
+        fetch: 'readonly',
+        Response: 'readonly',
+        Request: 'readonly',
+        RequestInit: 'readonly',
       },
     },
     plugins: {
@@ -45,6 +57,7 @@ export default [
     },
     rules: {
       ...tseslint.configs['recommended'].rules,
+      '@typescript-eslint/no-unused-vars': ['error', { argsIgnorePattern: '^_' }],
     },
   },
   {
