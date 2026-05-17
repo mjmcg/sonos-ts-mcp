@@ -10,7 +10,8 @@ export { alarmTools } from './alarm-tools.js';
 export { snapshotTools } from './snapshot-tools.js';
 export { eventTools } from './event-tools.js';
 export { musicServiceTools } from './music-service-tools.js';
-export { smapiAuthTools } from './smapi-auth-tools.js';
+// SMAPI auth tools hidden — see src/mcp/router.ts for rationale.
+// export { smapiAuthTools } from './smapi-auth-tools.js';
 export { agentTools } from './agent-tools.js';
 
 import { discoveryTools } from './discovery-tools.js';
@@ -23,7 +24,7 @@ import { alarmTools } from './alarm-tools.js';
 import { snapshotTools } from './snapshot-tools.js';
 import { eventTools } from './event-tools.js';
 import { musicServiceTools } from './music-service-tools.js';
-import { smapiAuthTools } from './smapi-auth-tools.js';
+// import { smapiAuthTools } from './smapi-auth-tools.js';
 import { agentTools } from './agent-tools.js';
 
 export const allTools: Tool[] = [
@@ -37,6 +38,6 @@ export const allTools: Tool[] = [
     ...snapshotTools,
     ...eventTools,
     ...musicServiceTools,
-    ...smapiAuthTools,
+    // ...smapiAuthTools,
     ...agentTools,
 ];

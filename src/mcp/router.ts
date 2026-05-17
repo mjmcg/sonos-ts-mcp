@@ -77,12 +77,17 @@ import {
     handlePlayMusicServiceItem,
     handleGetMusicServiceItemUri,
 } from './handlers/music-service-handlers.js';
-import {
-    handleSmapiAuthBegin,
-    handleSmapiAuthComplete,
-    handleSmapiAuthStatus,
-    handleSmapiAuthRemove,
-} from './handlers/smapi-auth-handlers.js';
+// SMAPI auth tools are hidden from the MCP surface because neither AppLink
+// (Apple Music, SiriusXM) nor the current DeviceLink flow (AccuRadio) can
+// complete from a headless MCP server. The handler code is preserved for
+// possible future revival — see scripts/probe-music-service-paths.ts for
+// the investigation that led to this decision.
+// import {
+//     handleSmapiAuthBegin,
+//     handleSmapiAuthComplete,
+//     handleSmapiAuthStatus,
+//     handleSmapiAuthRemove,
+// } from './handlers/smapi-auth-handlers.js';
 import { handleAgentInstruction } from './handlers/agent-handler.js';
 import { getAiConfig } from './config/env-config.js';
 
@@ -170,11 +175,11 @@ const baseHandlers: ToolHandlerMap = {
     'sonos_play_music_service_item': handlePlayMusicServiceItem,
     'sonos_get_music_service_item_uri': handleGetMusicServiceItemUri,
 
-    // SMAPI authentication handlers (human-driven setup, not agent flow)
-    'sonos_smapi_auth_begin': handleSmapiAuthBegin,
-    'sonos_smapi_auth_complete': handleSmapiAuthComplete,
-    'sonos_smapi_auth_status': handleSmapiAuthStatus,
-    'sonos_smapi_auth_remove': handleSmapiAuthRemove,
+    // SMAPI authentication handlers — hidden, see import block above.
+    // 'sonos_smapi_auth_begin': handleSmapiAuthBegin,
+    // 'sonos_smapi_auth_complete': handleSmapiAuthComplete,
+    // 'sonos_smapi_auth_status': handleSmapiAuthStatus,
+    // 'sonos_smapi_auth_remove': handleSmapiAuthRemove,
 };
 
 // Conditionally add agent handler if AI keys are configured
