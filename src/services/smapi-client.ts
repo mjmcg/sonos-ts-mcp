@@ -197,6 +197,14 @@ export class SMAPIClient {
      * On terminal failure, `lastFault` is set so the caller can surface
      * the actual SMAPI fault code/message to the user.
      */
+    /**
+     * Most recent raw response body, exposed for diagnostics when the
+     * structured fault path fails. Used by callers (auth_complete in
+     * particular) to surface "what did Sonos actually send back" when
+     * neither a fault nor a parseable token came through.
+     */
+    public lastResponseBody: string | null = null;
+
     async getDeviceAuthToken(
         householdId: string,
         linkCode: string,
@@ -220,8 +228,10 @@ export class SMAPIClient {
                     this.lastFault = null;
                     return { authToken, privateKey };
                 }
-                // 200 OK but no token in body — treat as terminal; we
-                // have no signal to retry on.
+                // 200 OK with no token AND no fault — Sonos sent back
+                // *something* but it's neither the success shape nor a
+                // SOAP fault. Treat as terminal; the caller will surface
+                // lastResponseBody so the user can see what happened.
                 return null;
             }
 
@@ -246,6 +256,7 @@ export class SMAPIClient {
         opts: { allowUnauthed?: boolean } = {}
     ): Promise<string | null> {
         this.lastFault = null;
+        this.lastResponseBody = null;
 
         const endpoint = this.serviceDescriptor.secureUri || this.serviceDescriptor.uri;
         if (!endpoint) {
@@ -273,6 +284,9 @@ export class SMAPIClient {
 
         const response = await this.postEnvelope(endpoint, method, envelope);
         if (!response) return null;
+
+        // Expose raw body for diagnostics regardless of success/failure.
+        this.lastResponseBody = response.body;
 
         // Check for SOAP fault FIRST — some services return 200 OK with a
         // Fault embedded. Previously this path silently returned an
@@ -343,6 +357,12 @@ export class SMAPIClient {
         method: string,
         envelope: string
     ): Promise<{ ok: boolean; status: number; body: string } | null> {
+        const debug = process.env.SMAPI_DEBUG === '1' || process.env.SMAPI_DEBUG === 'true';
+        if (debug) {
+            console.error(`[SMAPI DEBUG] POST ${endpoint}`);
+            console.error(`[SMAPI DEBUG] method=${method} service=${this.serviceDescriptor.name} (id=${this.serviceDescriptor.id})`);
+            console.error(`[SMAPI DEBUG] request envelope:\n${redactEnvelope(envelope)}`);
+        }
         try {
             const f = this.options.fetchImpl ?? fetch;
             const resp = await f(endpoint, {
@@ -354,6 +374,10 @@ export class SMAPIClient {
                 body: envelope,
             });
             const body = await resp.text();
+            if (debug) {
+                console.error(`[SMAPI DEBUG] response status=${resp.status} ok=${resp.ok}`);
+                console.error(`[SMAPI DEBUG] response body:\n${redactEnvelope(body)}`);
+            }
             return { ok: resp.ok, status: resp.status, body };
         } catch (error) {
             console.error('SMAPI request error:', error);
@@ -473,4 +497,48 @@ export class SMAPIClient {
         );
         return match ? (match[1]?.trim() ?? null) : null;
     }
+}
+
+/**
+ * Mask credential values inside SOAP envelopes for SMAPI_DEBUG output.
+ *
+ * Auth tokens, private keys, and refreshed credentials all show up in
+ * either the request envelope (when we have a loginToken) or the
+ * response envelope (when getDeviceAuthToken or a TokenRefreshRequired
+ * fault carries fresh credentials). Redact them in debug logs so users
+ * can paste log snippets without exposing the linked account.
+ *
+ * Link codes ARE shown — they're short-lived (5–10 minutes) and the
+ * whole point of debugging is to verify Sonos is seeing them correctly.
+ */
+function redactEnvelope(xml: string): string {
+    const REDACT_TAGS = ['token', 'authToken', 'privateKey', 'key', 'sessionId'];
+    let result = xml;
+    for (const tag of REDACT_TAGS) {
+        // Replace inner text; preserve tag + attributes for structural clarity.
+        const pattern = new RegExp(
+            `(<(?:\\w+:)?${tag}[^>]*>)([^<]+)(<\\/(?:\\w+:)?${tag}>)`,
+            'g',
+        );
+        result = result.replace(pattern, (_match, open, inner: string, close) => {
+            const masked = inner.length > 8
+                ? `<redacted:${inner.length}>`
+                : '<redacted>';
+            return `${open}${masked}${close}`;
+        });
+    }
+    return result;
+}
+
+/**
+ * Build a short, log-safe snippet of a SOAP response body for error
+ * messages. Trims to ~600 chars and runs the same credential redaction
+ * as the debug logger so callers can paste the error verbatim.
+ */
+export function summarizeResponseBody(body: string | null | undefined): string {
+    if (!body) return '(empty response)';
+    const redacted = redactEnvelope(body).trim();
+    const limit = 600;
+    if (redacted.length <= limit) return redacted;
+    return redacted.slice(0, limit) + `… (truncated, full length ${redacted.length})`;
 }

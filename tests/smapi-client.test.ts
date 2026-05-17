@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { SMAPIClient } from '../src/services/smapi-client.js';
+import { SMAPIClient, summarizeResponseBody } from '../src/services/smapi-client.js';
 import type { MusicServiceDescriptor } from '../src/types/music-services.js';
 
 function descriptor(authType: MusicServiceDescriptor['authType']): MusicServiceDescriptor {
@@ -368,5 +368,85 @@ describe('SMAPIClient.getMetadata', () => {
         expect(retryBody).toContain('<key>NEW_KEY</key>');
         expect(result.items).toEqual([]);
         errorSpy.mockRestore();
+    });
+
+    it('exposes lastResponseBody for diagnostic surfacing', async () => {
+        // 200 OK with neither fault nor expected response shape — exactly
+        // the "no SMAPI fault" case auth_complete needs to surface.
+        const weirdResponse = `<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <getDeviceAuthTokenResponse xmlns="http://www.sonos.com/Services/1.1">
+      <getDeviceAuthTokenResult>
+        <!-- service returned the wrapper but no token/key -->
+      </getDeviceAuthTokenResult>
+    </getDeviceAuthTokenResponse>
+  </s:Body>
+</s:Envelope>`;
+        const fetchImpl = vi.fn(async () =>
+            new Response(weirdResponse, { status: 200 })
+        ) as unknown as typeof fetch;
+        const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+        const client = new SMAPIClient(descriptor('DeviceLink'), {
+            deviceId: 'RINCON_AAA',
+            fetchImpl,
+        });
+        const result = await client.getDeviceAuthToken('Sonos_HH', 'CODE', 'RINCON_AAA', {
+            maxAttempts: 1,
+            baseDelayMs: 1,
+        });
+
+        expect(result).toBeNull();
+        expect(client.lastFault).toBeNull();
+        expect(client.lastResponseBody).toContain('getDeviceAuthTokenResult');
+        errorSpy.mockRestore();
+    });
+});
+
+describe('summarizeResponseBody', () => {
+    it('returns "(empty response)" for null/undefined/empty', () => {
+        expect(summarizeResponseBody(null)).toBe('(empty response)');
+        expect(summarizeResponseBody(undefined)).toBe('(empty response)');
+        expect(summarizeResponseBody('')).toBe('(empty response)');
+    });
+
+    it('redacts sensitive credential values while keeping tag structure', () => {
+        const xml = `<getDeviceAuthTokenResponse>
+  <authToken>secrettoken12345</authToken>
+  <privateKey>secretkey6789</privateKey>
+  <key>shortk</key>
+  <sessionId>sess-abc</sessionId>
+  <linkCode>USERCODE</linkCode>
+</getDeviceAuthTokenResponse>`;
+        const out = summarizeResponseBody(xml);
+        expect(out).not.toContain('secrettoken12345');
+        expect(out).not.toContain('secretkey6789');
+        expect(out).not.toContain('shortk');
+        expect(out).not.toContain('sess-abc');
+        // Tags themselves are preserved so the reader can see the structure.
+        expect(out).toContain('<authToken>');
+        expect(out).toContain('</authToken>');
+        // Link code is NOT redacted — it's short-lived and useful to verify.
+        expect(out).toContain('<linkCode>USERCODE</linkCode>');
+    });
+
+    it('redacts using length-encoded marker for long values', () => {
+        const xml = '<authToken>thisIsALongTokenValueOver8Chars</authToken>';
+        expect(summarizeResponseBody(xml)).toContain('<redacted:31>');
+    });
+
+    it('truncates very long responses', () => {
+        const long = '<root>' + 'x'.repeat(2000) + '</root>';
+        const out = summarizeResponseBody(long);
+        expect(out.length).toBeLessThan(700);
+        expect(out).toContain('truncated');
+    });
+
+    it('handles namespace-prefixed tags', () => {
+        const xml = '<ns:authToken xmlns:ns="urn:foo">secrettoken</ns:authToken>';
+        const out = summarizeResponseBody(xml);
+        expect(out).not.toContain('secrettoken');
+        expect(out).toContain('ns:authToken');
     });
 });

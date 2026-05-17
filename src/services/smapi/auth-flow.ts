@@ -28,7 +28,7 @@
 
 import type { MusicServiceDescriptor } from '../../types/music-services.js';
 import type { SonosDevice } from '../../types/sonos.js';
-import { SMAPIClient } from '../smapi-client.js';
+import { SMAPIClient, summarizeResponseBody } from '../smapi-client.js';
 import { resolveSmapiContext } from './auth-context.js';
 import { getTokenStore, type SmapiStoredToken } from './token-store.js';
 
@@ -199,19 +199,32 @@ export class SmapiAuthFlow {
         if (!pair) {
             const fault = client.lastFault;
             const baseMessage =
-                `getDeviceAuthToken returned no token pair for ${this.service.name}.`;
+                `getDeviceAuthToken returned no token pair for ${this.service.name} ` +
+                `(deviceId=${deviceId}, linkDeviceId=${effectiveLinkDeviceId}).`;
             if (fault) {
                 throw new Error(
                     `${baseMessage} SMAPI fault: ${fault.faultCode}: ${fault.faultString || '(no detail)'}. ` +
                     `Common causes: link code expired (re-run sonos_smapi_auth_begin), ` +
-                    `partner flow not yet propagated (retry in a few seconds), or the ` +
-                    `wrong linkDeviceId.`
+                    `partner approval not yet propagated after ~13s of retries (try ` +
+                    `clicking approve again on the partner site), wrong linkDeviceId, ` +
+                    `or you ran sonos_smapi_auth_begin against a different deviceId ` +
+                    `than this complete call (the link is bound to the deviceId in the ` +
+                    `credentials header — use the SAME deviceId for begin and complete).`
                 );
             }
+            // 200 OK with no fault AND no token. This is the diagnostic
+            // black hole; surface what Sonos actually sent back so the
+            // user (or a follow-up debug session) can see it.
+            const snippet = summarizeResponseBody(client.lastResponseBody);
             throw new Error(
-                `${baseMessage} No SMAPI fault returned — common causes: link code ` +
-                `expired or service silently rejected. Re-run sonos_smapi_auth_begin ` +
-                `to get a fresh code.`
+                `${baseMessage} HTTP 200 with neither a SOAP fault nor an authToken in ` +
+                `the response. This usually means the link code was already consumed, ` +
+                `the deviceId in the credentials header doesn't match the one used in ` +
+                `sonos_smapi_auth_begin, or the service replied with an unexpected ` +
+                `shape. Response body (credentials redacted):\n${snippet}\n\n` +
+                `If you're stuck, set SMAPI_DEBUG=1 in the container env, restart, ` +
+                `and rerun the flow — the container logs will show the full request ` +
+                `and response envelopes.`
             );
         }
 
@@ -251,21 +264,31 @@ export class SmapiAuthFlow {
 
     private applinkInstructions(appUrl: string, serviceName: string): string {
         return (
-            `${serviceName} returned only an app deep-link URL, not a typed ` +
-            `code. This flow is hard to complete from a containerised MCP ` +
-            `server because the partner-side redirect targets the Sonos app ` +
-            `(sonos://x-callback-url/...), which the MCP can't intercept.\n\n` +
-            `URL: ${appUrl}\n\n` +
-            `Options:\n` +
-            `  1. Link the service via a different tool that can register ` +
-            `as a sonos:// URL handler (e.g. sonoscli on a laptop), then ` +
-            `copy the token blob to MCP_DATA_DIR/smapi-tokens.json.\n` +
-            `  2. Open the URL in a browser, open DevTools, and capture the ` +
-            `partner redirect — the link code is in the URL fragment. Paste ` +
-            `that code to sonos_smapi_auth_complete.\n` +
-            `  3. Use sonos_get_favorites + sonos_play_favorite if you mainly ` +
-            `want to play stations / playlists you've already favorited in ` +
-            `the Sonos app — that path works without per-service linking.`
+            `${serviceName} returned ONLY an app deep-link URL, not a typed ` +
+            `code. This flow CANNOT be completed via the MCP server.\n\n` +
+            `What's happening: ${serviceName} hands off authentication to ` +
+            `its own app, which then redirects to sonos://x-callback-url/... ` +
+            `expecting the Sonos app to catch the callback and complete the ` +
+            `link. The MCP server has no way to intercept sonos:// URLs, and ` +
+            `opening ${appUrl} just gives you a "Cannot Connect" error inside ` +
+            `the partner app because the redirect target doesn't resolve.\n\n` +
+            `URL (for reference, but opening it WILL NOT WORK from MCP):\n` +
+            `  ${appUrl}\n\n` +
+            `Working alternatives:\n` +
+            `  1. RECOMMENDED — Use sonos_get_favorites + sonos_play_favorite ` +
+            `to play things you've already favorited from ${serviceName} in ` +
+            `the Sonos app. This path works because favorites carry the ` +
+            `service token via Sonos's internal mechanism, no MCP linking ` +
+            `needed.\n` +
+            `  2. Link via sonoscli (github.com/steipete/sonoscli) on a ` +
+            `laptop/Mac that has Sonos and ${serviceName} apps installed. ` +
+            `Its tokens are stored locally and can be transcribed into ` +
+            `MCP_DATA_DIR/smapi-tokens.json on the MCP host (same schema ` +
+            `as our token store: serviceId, householdId, authToken, ` +
+            `privateKey). Survives container rebuilds.\n` +
+            `  3. Skip this service in MCP entirely; use sonos_browse_music_service ` +
+            `against Anonymous services (TuneIn, SomaFM, CBC, NTS, etc.) ` +
+            `which don't require any link flow.`
         );
     }
 
