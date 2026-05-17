@@ -3,6 +3,7 @@ import { MusicServiceRegistry } from '../../discovery/music-service-registry.js'
 import { SMAPIClient } from '../../services/smapi-client.js';
 import { AVTransportService } from '../../services/av-transport.js';
 import { resolveSmapiContext } from '../../services/smapi/auth-context.js';
+import { getTokenStore } from '../../services/smapi/token-store.js';
 import type { MusicServiceItem, MusicServiceContainer, MusicServiceDescriptor } from '../../types/music-services.js';
 import type { SonosDevice } from '../../types/sonos.js';
 
@@ -24,19 +25,47 @@ function getRegistry(context: ServerContext, deviceId: string): MusicServiceRegi
 }
 
 /**
- * Build an SMAPI client wired up with the player's deviceId + householdId.
- * Commit 2 of the SMAPI rewrite will extend this to pull a stored
- * `loginToken` from the on-disk token store for authenticated services.
+ * Build an SMAPI client wired up with the player's deviceId, householdId,
+ * and (for authenticated services) the stored loginToken from disk.
+ *
+ * Anonymous services skip the token lookup. DeviceLink/AppLink services
+ * load the saved pair; if none exists, the call still goes through (the
+ * service will reject with an empty result or a SOAP fault, which surfaces
+ * the "needs linking" condition to the caller). Token-refresh faults are
+ * persisted back to the store via the onTokenRefresh callback before the
+ * retry happens.
  */
 async function buildSmapiClient(
     device: SonosDevice,
     serviceDescriptor: MusicServiceDescriptor,
 ): Promise<SMAPIClient> {
     const { householdId, deviceId } = await resolveSmapiContext(device);
+    const needsAuth =
+        serviceDescriptor.authType === 'DeviceLink' ||
+        serviceDescriptor.authType === 'AppLink';
+
+    const store = getTokenStore();
+    const stored = needsAuth
+        ? await store.load(serviceDescriptor.id, householdId)
+        : null;
+
     return new SMAPIClient(serviceDescriptor, {
         deviceId,
         householdId,
-        // loginToken is wired up in commit 2 once the token store lands.
+        loginToken: stored
+            ? { token: stored.authToken, key: stored.privateKey, householdId }
+            : undefined,
+        onTokenRefresh: pair => {
+            // Fire-and-forget: persist refreshed credentials before the
+            // SMAPIClient's retry uses them. Errors are logged but don't
+            // block the retry.
+            void store.refresh(serviceDescriptor.id, householdId, {
+                token: pair.token,
+                key: pair.key,
+            }).catch(err => {
+                console.error('[SMAPI] Failed to persist refreshed token:', err);
+            });
+        },
     });
 }
 

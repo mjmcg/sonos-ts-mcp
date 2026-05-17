@@ -77,6 +77,12 @@ import {
     handlePlayMusicServiceItem,
     handleGetMusicServiceItemUri,
 } from './handlers/music-service-handlers.js';
+import {
+    handleSmapiAuthBegin,
+    handleSmapiAuthComplete,
+    handleSmapiAuthStatus,
+    handleSmapiAuthRemove,
+} from './handlers/smapi-auth-handlers.js';
 import { handleAgentInstruction } from './handlers/agent-handler.js';
 import { getAiConfig } from './config/env-config.js';
 
@@ -163,6 +169,12 @@ const baseHandlers: ToolHandlerMap = {
     'sonos_search_music_service': handleSearchMusicService,
     'sonos_play_music_service_item': handlePlayMusicServiceItem,
     'sonos_get_music_service_item_uri': handleGetMusicServiceItemUri,
+
+    // SMAPI authentication handlers (human-driven setup, not agent flow)
+    'sonos_smapi_auth_begin': handleSmapiAuthBegin,
+    'sonos_smapi_auth_complete': handleSmapiAuthComplete,
+    'sonos_smapi_auth_status': handleSmapiAuthStatus,
+    'sonos_smapi_auth_remove': handleSmapiAuthRemove,
 };
 
 // Conditionally add agent handler if AI keys are configured
