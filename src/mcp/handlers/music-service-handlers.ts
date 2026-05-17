@@ -51,7 +51,6 @@ async function buildSmapiClient(
 
     return new SMAPIClient(serviceDescriptor, {
         deviceId,
-        householdId,
         loginToken: stored
             ? { token: stored.authToken, key: stored.privateKey, householdId }
             : undefined,

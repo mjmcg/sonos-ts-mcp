@@ -71,8 +71,11 @@ export class SmapiAuthFlow {
         const store = getTokenStore();
         return new SMAPIClient(this.service, {
             deviceId,
-            householdId,
-            // No loginToken: we're in the auth flow itself.
+            // No loginToken: we're in the auth flow itself. Per OEM
+            // docs, the pre-auth methods (getAppLink/getDeviceLinkCode/
+            // getDeviceAuthToken) take only deviceId + deviceProvider
+            // in the credentials header; householdId travels in the
+            // method body args.
             onTokenRefresh: pair => {
                 // Best-effort persist; fire-and-forget since the call
                 // chain is synchronous w.r.t. the retry.

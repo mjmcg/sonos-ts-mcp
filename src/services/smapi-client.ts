@@ -15,9 +15,12 @@ import {
  * SMAPI (Sonos Music API) client for third-party music services.
  *
  * Auth context is passed to the constructor and used to build the
- * `<credentials>` SOAP Header on every request. For DeviceLink and
- * AppLink services, supply a stored token pair via `loginToken`; SMAPI
- * will reject auth-required browse/search calls otherwise.
+ * `<s:credentials>` SOAP Header on every request per the OEM docs
+ * (https://docs.sonos.com/docs/soap-requests). For authenticated
+ * services (DeviceLink/AppLink) supply a stored token pair via
+ * `loginToken`; the envelope will emit it inside `<s:loginToken>`.
+ * For the pre-auth flow (getAppLink/getDeviceLinkCode/getDeviceAuthToken)
+ * omit `loginToken` entirely — the OEM spec wants no loginToken there.
  *
  * Token-refresh handling (Client.TokenRefreshRequired SOAP fault) is
  * delegated to the caller via the `onTokenRefresh` callback — when the
@@ -28,13 +31,16 @@ export interface SmapiClientOptions {
     /** R_TrialZPSerial from SystemProperties or the player's UDN. */
     deviceId: string;
     /**
-     * Household ID from DeviceProperties.GetHouseholdID — required by
-     * the documented envelope shape, which always carries it inside
-     * <s:loginToken><s:householdId>. Used by both the pre-auth flow and
-     * authenticated calls.
+     * Per OEM docs, "Sonos" for requests from a Sonos player.
+     * Defaults to "Sonos" if omitted.
      */
-    householdId: string;
-    /** Stored token pair for authenticated services. */
+    deviceProvider?: string;
+    /**
+     * Stored token pair for authenticated services. The householdId
+     * lives inside the loginToken per the OEM shape, so callers that
+     * need to pass household identity for an authenticated call must
+     * include it here. Omit entirely for the pre-auth flow.
+     */
     loginToken?: SmapiLoginToken;
     /**
      * Invoked when the service replies with a Client.TokenRefreshRequired
@@ -43,8 +49,6 @@ export interface SmapiClientOptions {
      * the return — the retry happens immediately after.
      */
     onTokenRefresh?: (pair: SmapiLoginToken) => void;
-    /** Optional timezone override; defaults to "+00:00". */
-    timezone?: string;
     /** Override fetch (used by tests). */
     fetchImpl?: typeof fetch;
 }
@@ -276,23 +280,18 @@ export class SMAPIClient {
 
         const envelope = buildSmapiEnvelope({
             method,
-            args: Object.fromEntries(
-                Object.entries(args).map(([k, v]) => [k, String(v)])
-            ),
+            args,
             credentials: {
                 deviceId: this.options.deviceId,
-                householdId: this.options.householdId,
-                // During the pre-auth flow we deliberately emit an empty
-                // loginToken (the envelope builder handles this when
-                // loginToken is undefined). Otherwise extract token+key
-                // from the stored pair — householdId is set above.
-                loginToken: opts.allowUnauthed || !this.options.loginToken
+                deviceProvider: this.options.deviceProvider,
+                // OEM shape: omit <s:loginToken> entirely for the
+                // pre-auth flow (getAppLink/getDeviceLinkCode/
+                // getDeviceAuthToken). For authenticated calls, pass
+                // the stored pair through — householdId rides along
+                // inside the loginToken.
+                loginToken: opts.allowUnauthed
                     ? undefined
-                    : {
-                        token: this.options.loginToken.token,
-                        key: this.options.loginToken.key,
-                    },
-                timezone: this.options.timezone,
+                    : this.options.loginToken,
             },
         });
 
@@ -320,26 +319,24 @@ export class SMAPIClient {
 
         if (fault.faultCode.includes('TokenRefreshRequired')) {
             const refreshed = this.extractRefreshedToken(response.body);
-            if (refreshed && this.options.onTokenRefresh) {
-                this.options.onTokenRefresh({
+            // Token refresh only happens on authenticated calls, so we
+            // must have a stored loginToken to pull the householdId from.
+            const householdId = this.options.loginToken?.householdId;
+            if (refreshed && householdId && this.options.onTokenRefresh) {
+                const newLoginToken: SmapiLoginToken = {
                     token: refreshed.authToken,
                     key: refreshed.privateKey,
-                    householdId: this.options.householdId,
-                });
+                    householdId,
+                };
+                this.options.onTokenRefresh(newLoginToken);
                 // Rebuild the envelope with the new token and retry once.
                 const retryEnvelope = buildSmapiEnvelope({
                     method,
-                    args: Object.fromEntries(
-                        Object.entries(args).map(([k, v]) => [k, String(v)])
-                    ),
+                    args,
                     credentials: {
                         deviceId: this.options.deviceId,
-                        householdId: this.options.householdId,
-                        loginToken: {
-                            token: refreshed.authToken,
-                            key: refreshed.privateKey,
-                        },
-                        timezone: this.options.timezone,
+                        deviceProvider: this.options.deviceProvider,
+                        loginToken: newLoginToken,
                     },
                 });
                 const retry = await this.postEnvelope(endpoint, method, retryEnvelope);
@@ -381,11 +378,12 @@ export class SMAPIClient {
                 method: 'POST',
                 headers: {
                     // Headers exactly as documented at
-                    // sonos.svrooij.io/music-services.html. Apple Music
-                    // (and likely other strict services) gate on a
-                    // Sonos-shaped User-Agent — without it we get the
-                    // empty-result / music:// dead-end paths.
-                    'Content-Type': 'text/xml; charset=utf8',
+                    // https://docs.sonos.com/docs/soap-requests. The
+                    // OEM-required pair is Content-Type + SOAPACTION;
+                    // Accept-Language/Accept-Encoding/User-Agent are
+                    // additive — partner backends (Apple Music in
+                    // particular) gate on a Sonos-shaped User-Agent.
+                    'Content-Type': 'text/xml; charset="utf-8"',
                     'SOAPACTION': buildSmapiSoapAction(method),
                     'Accept-Language': 'en-US',
                     'Accept-Encoding': 'gzip, deflate',
